@@ -1,0 +1,7 @@
+# Core app deps
+streamlit
+pandas
+numpy
+altair
+folium
+scikit-learn
