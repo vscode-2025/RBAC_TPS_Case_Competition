@@ -139,6 +139,8 @@ def load_data(
     """Load, filter, link, and aggregate data for the visualization."""
     if stops_path is None or crime_path is None:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), set(), pd.DataFrame()
+    if not Path(stops_path).exists() or not Path(crime_path).exists():
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), set(), pd.DataFrame()
 
     stops = load_stops(stops_path)
     crime = load_crime(crime_path)
@@ -382,6 +384,22 @@ def main():
         crime_path = default_crime if use_defaults else None
         stop_times_path = default_stop_times if use_defaults else None
         events_path = default_events if use_defaults and Path(default_events).exists() else None
+
+        # If using defaults, ensure files exist (e.g. on Streamlit Cloud repo may not include data files)
+        if use_defaults:
+            if not Path(default_stops).exists():
+                stops_path = None
+                st.warning(
+                    f"Default stops file not found: `{default_stops}`. Add it to the repo or upload below (uncheck Use repo defaults)."
+                )
+            if not Path(default_crime).exists():
+                crime_path = None
+                st.warning(
+                    f"Default crime file not found: `{default_crime}`. Add it to the repo or upload below (uncheck Use repo defaults)."
+                )
+            if stops_path is None or crime_path is None:
+                stop_times_path = None
+                events_path = None
 
         if not use_defaults:
             stops_file = st.file_uploader("stops.txt (CSV/TSV)", type=["csv", "txt", "tsv"])
