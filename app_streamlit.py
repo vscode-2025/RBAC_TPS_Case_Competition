@@ -299,13 +299,18 @@ def render_map(
     majority_type_lookup: dict[str, str] | None = None,
     trend_color_lookup: dict[str, str] | None = None,
     trend_text_lookup: dict[str, str] | None = None,
+    spike_color_lookup: dict[str, str] | None = None,
+    spike_blink_lookup: dict[str, bool] | None = None,
+    spike_text_lookup: dict[str, str] | None = None,
 ):
     if linked.empty or stops_for_map.empty:
         st.info("Load data to view the map.")
         return
-    fmap = make_map(
-        linked,
-        stops_for_map,
+    # Backwards-compatible call: some versions of `crime_around_stops.make_map`
+    # don't accept the rolling-trend keyword args. Detect support at runtime.
+    import inspect
+
+    kwargs = dict(
         freq=freq,
         radius_m=radius_m,
         risk_lookup=risk_lookup,
@@ -314,9 +319,21 @@ def render_map(
         event_daily_avg_lookup=event_daily_avg_lookup,
         normal_daily_avg_lookup=normal_daily_avg_lookup,
         majority_type_lookup=majority_type_lookup,
-        trend_color_lookup=trend_color_lookup,
-        trend_text_lookup=trend_text_lookup,
     )
+
+    sig = inspect.signature(make_map)
+    if "trend_color_lookup" in sig.parameters:
+        kwargs["trend_color_lookup"] = trend_color_lookup
+    if "trend_text_lookup" in sig.parameters:
+        kwargs["trend_text_lookup"] = trend_text_lookup
+    if "spike_color_lookup" in sig.parameters:
+        kwargs["spike_color_lookup"] = spike_color_lookup
+    if "spike_blink_lookup" in sig.parameters:
+        kwargs["spike_blink_lookup"] = spike_blink_lookup
+    if "spike_text_lookup" in sig.parameters:
+        kwargs["spike_text_lookup"] = spike_text_lookup
+
+    fmap = make_map(linked, stops_for_map, **kwargs)
     if event_points is not None and not event_points.empty:
         import folium
 
@@ -589,6 +606,39 @@ def main():
         )
         trend_text_lookup = dict(zip(trend_df["station_id"].astype(str), trend_df["trendText"]))
 
+    # Spike detection map lookups: gray shades (dark = spike, light = no spike), blink, and short text for popup
+    spike_color_lookup = None
+    spike_blink_lookup = None
+    spike_text_lookup = None
+    if not spike_df.empty:
+        # Different shades of gray: dark = spike, light = no spike
+        spike_color_lookup = dict(
+            zip(
+                spike_df["station_id"].astype(str),
+                spike_df.apply(
+                    lambda r: "#37474f" if r["spike"] else "#90a4ae",
+                    axis=1,
+                ),
+            )
+        )
+        spike_blink_lookup = dict(
+            zip(
+                spike_df["station_id"].astype(str),
+                spike_df["ui_flag"].apply(lambda f: bool((f or {}).get("blink", False))),
+            )
+        )
+        spike_text_lookup = dict(
+            zip(
+                spike_df["station_id"].astype(str),
+                spike_df.apply(
+                    lambda r: f"+{r['percentageAbove']:.0f}% above baseline"
+                    if r["spike"]
+                    else "Within baseline",
+                    axis=1,
+                ),
+            )
+        )
+
     cols = st.columns([2, 1])
     with cols[0]:
         st.subheader("Map")
@@ -606,6 +656,9 @@ def main():
             majority_type_lookup=majority_type_lookup,
             trend_color_lookup=trend_color_lookup,
             trend_text_lookup=trend_text_lookup,
+            spike_color_lookup=spike_color_lookup,
+            spike_blink_lookup=spike_blink_lookup,
+            spike_text_lookup=spike_text_lookup,
         )
     with cols[1]:
         st.subheader("Summary")

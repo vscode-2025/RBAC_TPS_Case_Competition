@@ -122,7 +122,6 @@ def load_crime(crime_path: str | pathlib.Path) -> pd.DataFrame:
     - long_wgs84 / longitude / lon / lng
     - division
     - MCI or a general crime type column (kept if present)
-    - optionally OCC_HOUR / REPORT_HOUR to set hour-of-day
     """
     crime_path = pathlib.Path(crime_path)
     crime = pd.read_csv(crime_path)
@@ -150,20 +149,6 @@ def load_crime(crime_path: str | pathlib.Path) -> pd.DataFrame:
     )
     crime["crime_dt"] = pd.to_datetime(crime["crime_dt"], errors="coerce")
     crime = crime[crime["crime_dt"].notna()].copy()
-
-    # If an hour column exists, combine with date; keep occ_hour for charts
-    hour_col = None
-    for cand in ["occ_hour", "OCC_HOUR", "report_hour", "REPORT_HOUR"]:
-        if cand in crime.columns:
-            hour_col = cand
-            break
-    if hour_col:
-        hours = pd.to_numeric(crime[hour_col], errors="coerce").fillna(0).clip(lower=0, upper=23)
-        crime["occ_hour"] = hours.astype(int)
-        crime["crime_dt"] = crime["crime_dt"].dt.normalize() + pd.to_timedelta(hours, unit="h")
-    else:
-        crime["occ_hour"] = crime["crime_dt"].dt.hour
-
     # Normalize division codes: accept formats like "D14" or "14"
     crime["division"] = (
         crime["division"]
@@ -253,26 +238,6 @@ def aggregate(df: pd.DataFrame, freq: str = "M") -> pd.DataFrame:
     return agg
 
 
-def hourly_counts_by_stop(df: pd.DataFrame, stop_id) -> pd.DataFrame:
-    """
-    Return counts by hour (0-23) for a given stop_id within the provided dataframe.
-    Prefers occ_hour if present, otherwise falls back to crime_dt hour.
-    """
-    if df.empty:
-        return pd.DataFrame({"hour": range(24), "count": [0] * 24})
-    subset = df[df["nearest_stop_id"] == stop_id].copy()
-    if subset.empty:
-        return pd.DataFrame({"hour": range(24), "count": [0] * 24})
-    if "occ_hour" in subset.columns:
-        hours = pd.to_numeric(subset["occ_hour"], errors="coerce").fillna(0).astype(int)
-    else:
-        hours = subset["crime_dt"].dt.hour
-    subset["hour"] = hours.clip(lower=0, upper=23)
-    counts = subset.groupby("hour").size().reindex(range(24), fill_value=0).reset_index()
-    counts.columns = ["hour", "count"]
-    return counts
-
-
 def make_map(
     linked: pd.DataFrame,
     stops: pd.DataFrame,
@@ -284,6 +249,11 @@ def make_map(
     event_daily_avg_lookup: dict[str, float] | None = None,
     normal_daily_avg_lookup: dict[str, float] | None = None,
     majority_type_lookup: dict[str, str] | None = None,
+    trend_color_lookup: dict[str, str] | None = None,
+    trend_text_lookup: dict[str, str] | None = None,
+    spike_color_lookup: dict[str, str] | None = None,
+    spike_blink_lookup: dict[str, bool] | None = None,
+    spike_text_lookup: dict[str, str] | None = None,
 ) -> folium.Map:
     # Base map centered on downtown Toronto
     m = folium.Map(location=[43.6532, -79.3832], zoom_start=12, tiles="CartoDB positron")
@@ -295,7 +265,7 @@ def make_map(
     # Stops: color by risk level when available
     level_colors = {
         "Low": "#9e9e9e",        # gray
-        "Moderate": "#f6c344",   # yellow
+        "Moderate": "#1f78b4",   # blue
         "Elevated": "#ff9800",   # orange
         "High": "#7b1fa2",       # purple
     }
@@ -345,6 +315,21 @@ def make_map(
                 normal_avg = normal_daily_avg_lookup.get(str(stop_id)) or normal_daily_avg_lookup.get(stop_id)
             if majority_type_lookup:
                 maj_type = majority_type_lookup.get(str(stop_id)) or majority_type_lookup.get(stop_id)
+            trend_color = None
+            trend_text = None
+            if trend_color_lookup:
+                trend_color = trend_color_lookup.get(str(stop_id)) or trend_color_lookup.get(stop_id)
+            if trend_text_lookup:
+                trend_text = trend_text_lookup.get(str(stop_id)) or trend_text_lookup.get(stop_id)
+            spike_color = None
+            spike_blink = False
+            spike_text = None
+            if spike_color_lookup:
+                spike_color = spike_color_lookup.get(str(stop_id)) or spike_color_lookup.get(stop_id)
+            if spike_blink_lookup:
+                spike_blink = spike_blink_lookup.get(str(stop_id)) or spike_blink_lookup.get(stop_id)
+            if spike_text_lookup:
+                spike_text = spike_text_lookup.get(str(stop_id)) or spike_text_lookup.get(stop_id)
             popup_html_parts = [
                 f"<b>{row.stop_name}</b><br>",
                 f"<span style='color:#666'>Stop ID:</span> {stop_id}<br>",
@@ -365,6 +350,13 @@ def make_map(
                 popup_html_parts.append(f"<br><span style='color:#666'>Risk level:</span> {level}")
             if maj_type is not None:
                 popup_html_parts.append(f"<br><span style='color:#666'>Top crime type:</span> {maj_type}")
+            if trend_text is not None:
+                popup_html_parts.append(f"<br><span style='color:#666'>Rolling trend:</span><br>{trend_text}")
+            if spike_text is not None:
+                popup_html_parts.append(
+                    f"<br><span style='color:#666'>2hr spike:</span> {spike_text}"
+                    + (" (blink)" if spike_blink else "")
+                )
 
             folium.RegularPolygonMarker(
                 location=[row.stop_lat, row.stop_lon],
@@ -375,6 +367,35 @@ def make_map(
                 fill_opacity=0.9,
                 popup=folium.Popup(html="".join(popup_html_parts), max_width=260),
             ).add_to(layer)
+
+            # Rolling trend overlay marker (color shows expectedRisk classification).
+            if trend_color:
+                folium.CircleMarker(
+                    location=[row.stop_lat, row.stop_lon],
+                    radius=4.5,
+                    color=trend_color,
+                    fill=True,
+                    fill_color=trend_color,
+                    fill_opacity=0.85,
+                    weight=2,
+                ).add_to(layer)
+
+            # Spike detection marker: dark gray = spike, light gray = no spike. Prominent ring + light fill.
+            if spike_color:
+                folium.CircleMarker(
+                    location=[row.stop_lat, row.stop_lon],
+                    radius=20,
+                    color=spike_color,
+                    fill=True,
+                    fill_color=spike_color,
+                    fill_opacity=0.25,
+                    weight=6,
+                    popup=folium.Popup(
+                        html=f"<b>2hr TPS rule</b><br>{spike_text or 'N/A'}"
+                        + ("<br><i>Blink in live UI</i>" if spike_blink else ""),
+                        max_width=220,
+                    ),
+                ).add_to(layer)
 
         # Individual crimes for this period
         for _, row in grp.iterrows():
@@ -417,30 +438,18 @@ def make_map(
             font-size: 12px;
             line-height: 1.4;
         ">
-          <b>Crime risk level</b><br>
+          <b>Risk level</b><br>
           <i style="background:#9e9e9e; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>Low<br>
-          <i style="background:#f6c344; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>Moderate<br>
+          <i style="background:#1f78b4; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>Moderate<br>
           <i style="background:#ff9800; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>Elevated<br>
           <i style="background:#7b1fa2; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>High<br>
         </div>
         """
         m.get_root().html.add_child(folium.Element(legend_html))
 
-    # Legend for division colors (circles)
-    if not linked.empty:
-        present_divs = sorted(linked["division"].astype(str).unique())
-        palette = ["#1f78b4", "#33a02c", "#e31a1c", "#6a3d9a", "#ff7f00", "#b15928", "#a6cee3", "#b2df8a"]
-
-        def div_color(div):
-            if div in DIVISION_COLORS:
-                return DIVISION_COLORS[div]
-            return palette[hash(div) % len(palette)]
-
-        div_legend_items = "".join(
-            f'<i style="background:{div_color(div)}; width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px;"></i>{div}<br>'
-            for div in present_divs
-        )
-        div_legend_html = f"""
+    # Legend for rolling trend colors (if provided)
+    if trend_color_lookup:
+        trend_legend_html = """
         <div style="
             position: fixed;
             bottom: 20px;
@@ -453,11 +462,35 @@ def make_map(
             font-size: 12px;
             line-height: 1.4;
         ">
-          <b>Division</b><br>
-          {div_legend_items}
+          <b>Rolling trend</b><br>
+          <i style="background:#F9A825; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>HIGH (delta &gt; 1.15)<br>
+          <i style="background:#FDD835; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>STABLE (0.9–1.15)<br>
+          <i style="background:#FFF9C4; width:12px; height:12px; display:inline-block; margin-right:6px; border:1px solid #ddd;"></i>DECREASING (delta &lt; 0.9)<br>
         </div>
         """
-        m.get_root().html.add_child(folium.Element(div_legend_html))
+        m.get_root().html.add_child(folium.Element(trend_legend_html))
+
+    # Legend for 2hr spike detection (if provided); place above risk legend; gray shades
+    if spike_color_lookup:
+        spike_legend_html = """
+        <div style="
+            position: fixed;
+            bottom: 120px;
+            left: 20px;
+            z-index: 9998;
+            background: white;
+            padding: 10px 12px;
+            border: 1px solid #ccc;
+            box-shadow: 0 0 6px rgba(0,0,0,0.25);
+            font-size: 12px;
+            line-height: 1.4;
+        ">
+          <b>2hr spike (TPS rule)</b><br>
+          <i style="width:14px; height:14px; display:inline-block; margin-right:6px; background:#37474f; border:2px solid #263238; border-radius:50%; box-sizing:border-box;"></i>Spike (blink)<br>
+          <i style="width:14px; height:14px; display:inline-block; margin-right:6px; background:#90a4ae; border:2px solid #78909c; border-radius:50%; box-sizing:border-box;"></i>No spike<br>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(spike_legend_html))
 
     return m
 
@@ -467,7 +500,7 @@ def make_map(
 # ----------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Map TPS crimes near TTC stops.")
-    p.add_argument("--stops", default="data/Complete GTFS/stops.txt", help="Path to GTFS stops.txt")
+    p.add_argument("--stops", default="Complete GTFS/stops.txt", help="Path to GTFS stops.txt")
     p.add_argument(
         "--stop-times",
         default="data/processed/stop_times_with_stops.csv.gz",
